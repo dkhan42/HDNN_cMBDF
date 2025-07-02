@@ -1,17 +1,17 @@
-
 import numpy as np
+import os
+import copy
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset, random_split
 from tqdm import tqdm
-from ase.build import molecule
-from ase import Atoms
 
-# Set seeds for reproducibility
-seed = 42
-np.random.seed(seed)
-torch.manual_seed(seed)
+def pad_charges(q, pad):
+    temp  = np.zeros(pad)
+    size = len(q)
+    temp[:size] = q
+    return temp
 
 # Define the atomic network (a simple feedforward NN)
 class AtomicNN(nn.Module):
@@ -32,7 +32,7 @@ class AtomicNN(nn.Module):
     def forward(self, x):
         return self.layers(x)
 
-# Define an element-specific HDNN.
+# Define an element-specific ANI network.
 class ElementSpecificNN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, species):
         super(ElementSpecificNN, self).__init__()
@@ -61,50 +61,145 @@ class ElementSpecificNN(nn.Module):
         atomic_energies = atomic_energies.view(batch_size, num_atoms)
         total_energy = atomic_energies.sum(dim=1)
         return total_energy
-
-# Improved training function with AdamW, weight decay, and a learning rate scheduler.
-def train_model(model, train_loader, test_loader, device, epochs=300, lr=1e-3):
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=20, factor=0.5, verbose=True)
-    criterion = nn.L1Loss()  # Mean Absolute Error
-    model.to(device)
     
-    for epoch in range(epochs):
+
+def prepare_data_loaders(xtrain, ytrain, qtrain, batch_size=64, train_val_split=0.8):
+    # Convert to tensors
+    x_tensor = torch.tensor(xtrain, dtype=torch.float32)
+    y_tensor = torch.tensor(ytrain, dtype=torch.float32)
+    q_tensor = torch.tensor(qtrain, dtype=torch.float32)
+
+    # Combine into one dataset
+    full_dataset = TensorDataset(x_tensor, y_tensor, q_tensor)
+
+    # Compute split sizes
+    total_size = len(full_dataset)
+    train_size = int(train_val_split * total_size)
+    val_size = total_size - train_size
+
+    # Split into training and validation sets
+    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+
+    # Create data loaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    return train_loader, val_loader
+
+
+# Function for training the model
+def train_model(
+    model,
+    xtrain,
+    ytrain,
+    qtrain,
+    batch_size,
+    device,
+    train_val_split=0.8,
+    epochs=300,
+    lr=1e-3,                   #Initial learning rate
+    weight_decay=1e-4,         #L2 reguralization
+    es_patience=30,            # early stopping patience
+    grad_clip=5.0,             # max norm for gradient clipping
+    checkpoint_path="best_model.pth",
+):
+    # prepare data
+    train_loader, val_loader = prepare_data_loaders(
+        xtrain, ytrain, qtrain, batch_size, train_val_split
+    )
+
+    model.to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", patience=15, factor=0.5
+    )
+    criterion = torch.nn.MSELoss()
+
+    best_val = float("inf")
+    best_model_wts = copy.deepcopy(model.state_dict())
+    es_counter = 0
+
+    train_losses, val_losses = [], []
+
+    for epoch in tqdm(range(1, epochs + 1), desc="Epochs"):
+        # ——— Training ———
         model.train()
-        train_loss = 0.0
+        running_loss = 0.0
         n_train = 0
-        for batch in train_loader:
-            x, y, q = batch  # x: representations, y: energies, q: charges
+        for x, y, q in train_loader:
             x, y, q = x.to(device), y.to(device), q.to(device)
             optimizer.zero_grad()
-            pred = model(x, q)
-            loss = criterion(pred, y)
+            preds = model(x, q)
+            loss = criterion(preds, y)
             loss.backward()
+
+            # gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
             optimizer.step()
-            train_loss += loss.item() * x.size(0)
+            running_loss += loss.item() * x.size(0)
             n_train += x.size(0)
-        avg_train_loss = train_loss / n_train
-        
-        # Evaluate on the test set
+
+        avg_train = running_loss / n_train
+
+        # ——— Validation ———
         model.eval()
-        total_loss = 0.0
-        n_test = 0
+        val_running = 0.0
+        n_val = 0
         with torch.no_grad():
-            for batch in test_loader:
-                x, y, q = batch
+            for x, y, q in val_loader:
                 x, y, q = x.to(device), y.to(device), q.to(device)
-                pred = model(x, q)
-                total_loss += criterion(pred, y).item() * x.size(0)
-                n_test += x.size(0)
-        avg_test_loss = total_loss / n_test
-        
-        scheduler.step(avg_train_loss)
-        
-        if (epoch + 1) % 50 == 0 or epoch == 0:
-            print(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f} - Test Loss: {avg_test_loss:.4f}")
-    
-    return avg_test_loss
+                preds = model(x, q)
+                val_running += criterion(preds, y).item() * x.size(0)
+                n_val += x.size(0)
 
-# Set device (GPU if available)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        avg_val = val_running / n_val
 
+        # scheduler steps on validation, or you can change to avg_train
+        scheduler.step(avg_val)
+
+        train_losses.append(avg_train)
+        val_losses.append(avg_val)
+
+        # print progress
+        if epoch % 50 == 0 or epoch == 1:
+            print(f"Epoch {epoch:3d}/{epochs}  •  train: {avg_train:.4e}  •  val: {avg_val:.4e}")
+
+        # ——— Early Stopping & Checkpointing ———
+        if avg_val < best_val:
+            best_val = avg_val
+            best_model_wts = copy.deepcopy(model.state_dict())
+            torch.save(model.state_dict(), checkpoint_path)
+            es_counter = 0
+        else:
+            es_counter += 1
+            if es_counter >= es_patience:
+                print(f"Early stopping at epoch {epoch}, best val loss {best_val:.4e}")
+                break
+
+    # Restore best weights
+    model.load_state_dict(best_model_wts)
+
+    return model, np.array(train_losses), np.array(val_losses)
+
+#Function for obtaining predictions using a trained model
+def get_predictions(model, xtest, ytest, qtest, batch_size, device):
+    x_test_tensor = torch.tensor(xtest, dtype=torch.float32)
+    y_test_tensor = torch.tensor(ytest, dtype=torch.float32)
+    q_test_tensor = torch.tensor(qtest, dtype=torch.float32)
+    test_dataset = TensorDataset(x_test_tensor, y_test_tensor, q_test_tensor)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
+
+    model.to(device)
+
+    preds = []
+
+    with torch.no_grad():
+        for batch in tqdm(test_loader, desc = 'Predicting batches: '):
+            x, y, q = batch
+            x, y, q = x.to(device), y.to(device), q.to(device)
+            pred = model(x, q)
+            preds.extend(pred)
+
+    return np.array([x.cpu() for x in preds])
