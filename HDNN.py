@@ -99,9 +99,10 @@ def train_model(
     epochs=300,
     lr=1e-3,                   #Initial learning rate
     weight_decay=1e-4,         #L2 reguralization
-    es_patience=30,            # early stopping patience
+    es_patience=150,            # early stopping patience
     grad_clip=5.0,             # max norm for gradient clipping
     checkpoint_path="best_model.pth",
+    lr_patience=30             # Patience for reducing learning rate
 ):
     # prepare data
     train_loader, val_loader = prepare_data_loaders(
@@ -112,7 +113,7 @@ def train_model(
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", patience=15, factor=0.5
+        optimizer, mode="min", patience=lr_patience, factor=0.5
     )
     criterion = torch.nn.MSELoss()
 
