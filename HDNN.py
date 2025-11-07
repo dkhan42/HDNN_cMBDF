@@ -32,7 +32,7 @@ class AtomicNN(nn.Module):
     def forward(self, x):
         return self.layers(x)
 
-# Define an element-specific ANI network.
+# Define an element-specific HDNN.
 class ElementSpecificNN(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim, species):
         super(ElementSpecificNN, self).__init__()
